@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Lint + a model-free probe self-test. End-to-end model runs require local
+# Apple-Silicon hardware (Ollama + Claude Code) and are NOT run in CI.
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zsh (shellcheck is preinstalled on ubuntu-latest)
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: ShellCheck (bash scripts)
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning setup.sh uninstall.sh install/*.sh tests/smoke.sh
+
+      - name: zsh -n (launcher syntax)
+        env:
+          CLAUDE_LOCAL_FAST_DIR: ${{ github.workspace }}
+        run: zsh -n shell/claude-local-fast.zsh
+
+      - name: py_compile (proxy)
+        run: python3 -m py_compile proxy/cc_proxy.py
+
+      - name: Validate settings JSON
+        run: python3 -c "import json; json.load(open('claude/settings.local-fast.json'))"
+
+      - name: Smoke test (model-free probe self-test)
+        run: bash tests/smoke.sh
