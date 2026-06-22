@@ -1,0 +1,21 @@
+# Qwen3 4B Instruct (2507) — everyday LOCAL profile for Claude Code on 8GB M1.
+# Build: ollama create qwen3-local -f "$CLAUDE_LOCAL_FAST_DIR/ollama/Modelfile.qwen3-local"
+# Used by the `claude-local-full` zsh function (ALL built-in tools).
+FROM qwen3:4b-instruct-2507-q4_K_M
+
+# 16k context — fits an 8GB M1 alongside macOS + a browser without swapping.
+# (32k pre-allocates a ~3GB KV cache and overcommits the ~5.3GB usable RAM.)
+# VERIFY it stays on the GPU after building:  ollama ps   (look for 100% GPU)
+PARAMETER num_ctx 16384
+
+# Full GPU offload (Metal) — the 2.5GB weights fit in unified memory.
+PARAMETER num_gpu 99
+
+# Official Qwen3-4B-Instruct-2507 sampling (stable tool-call JSON).
+# NOTE: Ollama defaults repeat_penalty to 1.1, which corrupts code/JSON —
+# Qwen wants 1.0, so it is set explicitly here.
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER min_p 0
+PARAMETER repeat_penalty 1.0

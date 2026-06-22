@@ -1,0 +1,24 @@
+# Backups written by install_shell.sh / uninstall.sh
+*.bak.*
+*.claude-local-fast.bak.*
+
+# Proxy/probe runtime artifacts
+cc_proxy*.log
+cc_proxy.serverlog
+cc_proxy/
+turn_*.front.txt
+turn_*.json
+summary.log
+
+# Ollama serve log written by _ollama_serve_tuned
+ollama_serve.log
+
+# Python bytecode (e.g. from py_compile in tests)
+__pycache__/
+*.pyc
+
+# macOS / editors
+.DS_Store
+*.swp
+.idea/
+.vscode/

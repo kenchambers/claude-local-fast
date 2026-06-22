@@ -1,0 +1,24 @@
+# Qwen3 4B Instruct (2507) — AIRPLANE profile for Claude Code on 8GB M1.
+# Build: ollama create qwen3-air -f "$CLAUDE_LOCAL_FAST_DIR/ollama/Modelfile.qwen3-air"
+# Used by the `claude-air` zsh function. Prioritizes: offline > battery > speed.
+FROM qwen3:4b-instruct-2507-q4_K_M
+
+# 16k context — comfortably 100% GPU-resident on 8GB (no swap/CPU spill).
+# This is the #1 battery/thermal/stability lever. 16k is plenty for focused
+# single-file coding. Only raise toward 32k if `ollama ps` still shows 100% GPU.
+PARAMETER num_ctx 16384
+
+# Full GPU offload (Metal) — most perf-per-watt efficient.
+PARAMETER num_gpu 99
+
+# Cap CPU work to shave the prefill thermal spike on a fanless M1.
+PARAMETER num_thread 4
+PARAMETER num_batch 256
+
+# Official Qwen3-4B-Instruct-2507 sampling (stable tool calls; repeat_penalty
+# forced to 1.0 because Ollama's 1.1 default corrupts code/JSON tokens).
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER min_p 0
+PARAMETER repeat_penalty 1.0

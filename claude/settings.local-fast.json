@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "enableAllProjectMcpServers": false,
+  "disableBundledSkills": true,
+  "skillListingBudgetFraction": 0.003,
+  "includeGitInstructions": false,
+  "enabledPlugins": {
+    "python-development@claude-code-workflows": false,
+    "code-documentation@claude-code-workflows": false,
+    "code-review-ai@claude-code-workflows": false,
+    "full-stack-orchestration@claude-code-workflows": false,
+    "pyright-lsp@claude-plugins-official": false,
+    "code-simplifier@claude-plugins-official": false,
+    "ui-ux-pro-max@ui-ux-pro-max-skill": false
+  },
+  "claudeMdExcludes": [
+    "**/CLAUDE.md"
+  ]
+}
