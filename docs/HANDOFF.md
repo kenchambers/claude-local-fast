@@ -58,7 +58,7 @@ only prefills tokens after the first divergence. Measured **~40×** on turn 2
 disproven.
 
 The earlier "no reuse" conclusion was a measurement bug: it watched
-`prompt_eval_count` (which reports the full length even on a cache HIT — the real
+`prompt_eval_count` (which reports the full length even on a cache hit — the real
 signal is `prompt_eval_duration`) and changed the *suffix* (a branch, not an
 extension). The cache busts only when something changes near the **front** of the
 prompt. Claude Code puts its per-turn dynamic content (date, CLAUDE.md,

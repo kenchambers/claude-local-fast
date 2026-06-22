@@ -40,7 +40,15 @@ else
 fi
 
 # ---- 4. probe self-test (model-free) ----
-PORT=11539
+# Pick a free ephemeral port so the test is deterministic even if 11539 is busy.
+PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
 LOG="$(mktemp -d "${TMPDIR:-/tmp}/clf_probe.XXXXXX")"
 CC_PROXY_MODE=probe CC_PROXY_PORT="$PORT" CC_PROXY_LOG="$LOG" \
   python3 "$REPO/proxy/cc_proxy.py" >"$LOG/server.log" 2>&1 &

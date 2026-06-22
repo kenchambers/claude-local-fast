@@ -97,7 +97,13 @@ if have claude; then
 elif have npm; then
   log "Installing Claude Code (npm -g @anthropic-ai/claude-code)…"
   npm install -g @anthropic-ai/claude-code
-  record "Claude Code   | installed"
+  if have claude; then
+    record "Claude Code   | installed"
+  else
+    warn "Installed the package, but 'claude' is not on PATH in this shell."
+    warn "Open a new shell or add npm's global bin to PATH, then re-run."
+    record "Claude Code   | MISSING (PATH)"
+  fi
 else
   warn "Cannot install Claude Code without npm. Install Node first."
   record "Claude Code   | MISSING"

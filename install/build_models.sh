@@ -28,19 +28,24 @@ die()  { printf '%s\n' "${C_R}[models] error:${C_0} $*" >&2; exit 1; }
 
 command -v ollama >/dev/null 2>&1 || die "ollama not found — run install/deps.sh first."
 
+# Pin the daemon address up front so the reachability check and every
+# `ollama pull`/`ollama create` below target the SAME daemon, even if
+# OLLAMA_HOST was pre-set in the environment to something else.
+export OLLAMA_HOST=127.0.0.1:11434
+
 # Names from `ollama list` carry a ":latest" suffix on created tags; strip it.
 model_present() { # $1 = tag/name
   ollama list 2>/dev/null | awk '{print $1}' | sed 's/:latest$//' | grep -qx "$1"
 }
 
 # Ensure the Ollama daemon is reachable (start it tuned/offline-safe if not).
-if ! curl -s http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+if ! curl -s "http://${OLLAMA_HOST}/api/version" >/dev/null 2>&1; then
   log "Starting Ollama (8GB-tuned, offline-safe)…"
-  export OLLAMA_HOST=127.0.0.1:11434 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 \
+  export OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 \
          OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_KEEP_ALIVE=5m OLLAMA_NO_CLOUD=1
   nohup ollama serve >"${TMPDIR:-/tmp}/ollama_serve.log" 2>&1 &
   t=0
-  until curl -s http://127.0.0.1:11434/api/version >/dev/null 2>&1; do
+  until curl -s "http://${OLLAMA_HOST}/api/version" >/dev/null 2>&1; do
     sleep 1; t=$((t+1))
     [ "$t" -ge 20 ] && die "Ollama didn't start — see ${TMPDIR:-/tmp}/ollama_serve.log"
   done

@@ -17,7 +17,8 @@ while [ "$#" -gt 0 ]; do
     --shell=*) TARGET_SHELL="${1#*=}"; shift ;;
     --dir) DIR_OVERRIDE="${2:-}"; shift 2 ;;
     --dir=*) DIR_OVERRIDE="${1#*=}"; shift ;;
-    *) shift ;;
+    # die() isn't defined yet at parse time; fail fast with a plain message.
+    *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 

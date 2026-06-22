@@ -89,4 +89,13 @@ else
 fi
 
 printf '\n%s\n' "${C_B}✅ Done.${C_0}"
-printf 'Next:\n  source ~/.zshrc\n  claude-local --help\n'
+if [ "$DO_SHELL" = 1 ] && [ "$TARGET_SHELL" != "bash" ]; then
+  # Shell wiring ran for zsh (explicit --shell zsh or auto-detected).
+  printf 'Next:\n  source ~/.zshrc\n  claude-local --help\n'
+elif [ "$DO_SHELL" = 1 ]; then
+  # --shell bash: install_shell.sh made no changes (launchers are zsh-only).
+  printf 'Next:\n  The launchers are zsh-only. Start zsh, then run:\n    install/install_shell.sh --shell zsh\n'
+else
+  # --no-shell: wiring was skipped entirely.
+  printf 'Next:\n  Wire the launchers when ready:\n    install/install_shell.sh --shell zsh\n'
+fi

@@ -11,7 +11,9 @@ jobs:
   lint-and-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Install zsh (shellcheck is preinstalled on ubuntu-latest)
         run: sudo apt-get update && sudo apt-get install -y zsh

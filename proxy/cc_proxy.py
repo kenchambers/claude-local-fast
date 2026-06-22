@@ -23,6 +23,7 @@ Env:
   CC_PROXY_PORT=11435              (listen port)
   CC_PROXY_LOG=/tmp/cc_proxy       (where turn_NNN.* + summary.log land)
   CC_PROXY_UPSTREAM=http://127.0.0.1:11434   (Ollama, forward mode only)
+  CC_PROXY_TIMEOUT_SEC=600         (upstream read timeout, forward mode only)
 """
 import os, json, hashlib, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,11 @@ MODE     = os.environ.get("CC_PROXY_MODE", "probe")
 PORT     = int(os.environ.get("CC_PROXY_PORT", "11435"))
 LOGDIR   = os.environ.get("CC_PROXY_LOG", "/tmp/cc_proxy")
 UPSTREAM = os.environ.get("CC_PROXY_UPSTREAM", "http://127.0.0.1:11434")
+# Upstream read timeout (forward mode). Default is generous because the first
+# turn re-prefills a ~28k-token tool schema, which can take ~2 min on an 8GB M1.
+# Lower it via CC_PROXY_TIMEOUT_SEC to bound how long a stalled upstream can pin
+# a request thread.
+UPSTREAM_TIMEOUT = float(os.environ.get("CC_PROXY_TIMEOUT_SEC", "600"))
 os.makedirs(LOGDIR, exist_ok=True)
 
 _seq_lock = threading.Lock()
@@ -122,8 +128,10 @@ class H(BaseHTTPRequestHandler):
             if is_msgs or is_count:
                 try:
                     log_request(body, beta)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Probe logging is the whole point in probe mode; surface
+                    # failures to stderr instead of letting them vanish.
+                    print(f"[cc_proxy] log_request failed: {e}", flush=True)
 
             if MODE == "forward":
                 self._forward(raw); return
@@ -170,7 +178,7 @@ class H(BaseHTTPRequestHandler):
                 continue
             req.add_header(k, v)
         try:
-            resp = urllib.request.urlopen(req, timeout=600)
+            resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
             code, data = resp.status, resp.read()
             ctype = resp.headers.get("Content-Type", "application/json")
         except urllib.error.HTTPError as e:
