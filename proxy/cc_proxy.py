@@ -16,7 +16,19 @@ Modes (env CC_PROXY_MODE):
                      RAM-safe. Use to diff turn-to-turn prefix stability.
   forward          : transparently forward to Ollama and log the same
                      fingerprints (buffered; SSE is relayed non-streaming
-                     for now — fine for diagnostics).
+                     for now — fine for diagnostics). Also records, per turn,
+                     the upstream wall-clock latency + any prefill/usage
+                     fields the backend returns — turn-2 latency collapse is
+                     the cache-HIT signal (ollama/ollama#2068: on a hit
+                     prompt_eval_count can drop out, so watch the DURATION,
+                     not the count).
+
+Telemetry (both modes): every real /v1/messages turn records
+`prefix_stable_vs_prev` — whether its static prefix (system+tools) is
+byte-identical to the previous such turn. That byte-stability is the
+PRECONDITION for Ollama prefix-KV reuse, so the verdict is now permanent
+and automatic (no manual claude-local-prefix-diff step needed). Read it in
+summary.log or turn_NNN.json (true = reuse-eligible, false = prefix busted).
 
 Env:
   CC_PROXY_MODE=probe|forward      (default probe)
@@ -25,7 +37,7 @@ Env:
   CC_PROXY_UPSTREAM=http://127.0.0.1:11434   (Ollama, forward mode only)
   CC_PROXY_TIMEOUT_SEC=600         (upstream read timeout, forward mode only)
 """
-import os, json, hashlib, threading, urllib.request, urllib.error
+import os, json, time, hashlib, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODE     = os.environ.get("CC_PROXY_MODE", "probe")
@@ -47,11 +59,23 @@ def _next_seq():
         _seq += 1
         return _seq
 
+# Turn-to-turn prefix-stability tracker. Only real /v1/messages turns update it
+# (count_tokens shares the same prefix and would interleave, so it's excluded).
+_front_lock = threading.Lock()
+_last_msgs_front_sha = None
+
 def _sha(s):
     return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
 
-def log_request(body, beta):
-    """Persist the static prefix (system+tools) + per-message fingerprints."""
+def log_request(body, beta, track_stability=False):
+    """Persist the static prefix (system+tools) + per-message fingerprints.
+
+    When track_stability is set (real /v1/messages turns), also record whether
+    this turn's static prefix is byte-identical to the previous such turn —
+    `prefix_stable_vs_prev`. That byte-stability is the precondition for Ollama
+    prefix-KV reuse, so the verdict is permanent telemetry rather than a manual
+    prefix-diff step. count_tokens turns pass track_stability=False so they
+    don't pollute the comparison (they share the same prefix)."""
     seq = _next_seq()
     system   = body.get("system", "")
     tools    = body.get("tools", [])
@@ -60,6 +84,17 @@ def log_request(body, beta):
     tools_str = json.dumps(tools, ensure_ascii=False)
     front = sys_str + "\n---TOOLS---\n" + tools_str
     front_sha = _sha(front)
+
+    prev_front_sha = None
+    prefix_stable = None   # None until there's a prior tracked turn to compare to
+    if track_stability:
+        global _last_msgs_front_sha
+        with _front_lock:
+            prev_front_sha = _last_msgs_front_sha
+            _last_msgs_front_sha = front_sha
+        if prev_front_sha is not None:
+            prefix_stable = (prev_front_sha == front_sha)
+
     with open(os.path.join(LOGDIR, f"turn_{seq:03d}.front.txt"), "w") as f:
         f.write(front)
     msg_fp = []
@@ -71,15 +106,67 @@ def log_request(body, beta):
         "num_tools": len(tools) if isinstance(tools, list) else 0,
         "tool_bytes": len(tools_str), "system_bytes": len(sys_str),
         "front_sha256": front_sha, "anthropic_beta": beta,
+        "prev_front_sha256": prev_front_sha, "prefix_stable_vs_prev": prefix_stable,
         "num_messages": len(messages), "messages": msg_fp,
     }
     with open(os.path.join(LOGDIR, f"turn_{seq:03d}.json"), "w") as f:
         json.dump(summary, f, indent=1)
+    if not track_stability:
+        mark = "n/a"
+    elif prefix_stable is None:
+        mark = "first"
+    else:
+        mark = "yes" if prefix_stable else "no"
     with open(os.path.join(LOGDIR, "summary.log"), "a") as f:
         f.write(f"turn {seq:03d} | tools={summary['num_tools']:>2} "
                 f"tool_bytes={summary['tool_bytes']:>6} sys_bytes={summary['system_bytes']:>6} "
-                f"msgs={summary['num_messages']:>2} front_sha={front_sha[:12]} beta={beta or '-'}\n")
+                f"msgs={summary['num_messages']:>2} front_sha={front_sha[:12]} "
+                f"prefix_stable={mark:<5} beta={beta or '-'}\n")
     return summary
+
+def _log_forward_timing(summary, elapsed_ms, data, ctype):
+    """Forward mode: record the per-turn cache-HIT outcome signal next to the
+    request fingerprint. The headline is upstream wall-clock latency (it
+    collapses ~40x on a prefix-KV reuse); prompt_eval_duration is parsed
+    defensively because only Ollama's NATIVE /api/chat shape carries it — the
+    Anthropic-compat /v1/messages shape exposes usage.{input,output}_tokens but
+    no prefill timing. Per ollama/ollama#2068 the reliable hit signal is the
+    DURATION collapsing, not the token count (which can drop out on a hit)."""
+    if not summary:
+        return
+    seq = summary.get("seq")
+    rec = {
+        "seq": seq,
+        "upstream_ms": round(elapsed_ms, 1),
+        "front_sha256": summary.get("front_sha256"),
+        "prefix_stable_vs_prev": summary.get("prefix_stable_vs_prev"),
+    }
+    if "json" in (ctype or "").lower():
+        try:
+            body = json.loads(data)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            for k in ("prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
+                if k in body:
+                    rec[k] = body[k]
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                for k in ("input_tokens", "output_tokens"):
+                    if k in usage:
+                        rec["usage_" + k] = usage[k]
+    ped = rec.get("prompt_eval_duration")
+    if isinstance(ped, (int, float)):
+        rec["prefill_seconds"] = round(ped / 1e9, 3)   # Ollama reports nanoseconds
+    if seq is not None:
+        with open(os.path.join(LOGDIR, f"turn_{seq:03d}.timing.json"), "w") as f:
+            json.dump(rec, f, indent=1)
+    prefill = rec.get("prefill_seconds")
+    seq_str = f"{seq:03d}" if seq is not None else "?"
+    with open(os.path.join(LOGDIR, "summary.log"), "a") as f:
+        f.write(f"  forward seq={seq_str} upstream={rec['upstream_ms']:.0f}ms"
+                + (f" prefill={prefill:.3f}s" if prefill is not None else "")
+                + "\n")
 
 def _canned(model):
     return {
@@ -125,16 +212,17 @@ class H(BaseHTTPRequestHandler):
 
             is_msgs  = self.path.startswith("/v1/messages") and "count_tokens" not in self.path
             is_count = "count_tokens" in self.path
+            summary = None
             if is_msgs or is_count:
                 try:
-                    log_request(body, beta)
+                    summary = log_request(body, beta, track_stability=is_msgs)
                 except Exception as e:
                     # Probe logging is the whole point in probe mode; surface
                     # failures to stderr instead of letting them vanish.
                     print(f"[cc_proxy] log_request failed: {e}", flush=True)
 
             if MODE == "forward":
-                self._forward(raw); return
+                self._forward(raw, summary); return
 
             # ---- PROBE mode: answer locally, never load the model ----
             if is_count:
@@ -171,12 +259,13 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _forward(self, raw):
+    def _forward(self, raw, summary=None):
         req = urllib.request.Request(UPSTREAM + self.path, data=raw, method="POST")
         for k, v in self.headers.items():
             if k.lower() in ("host", "content-length"):
                 continue
             req.add_header(k, v)
+        t0 = time.monotonic()
         try:
             resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
             code, data = resp.status, resp.read()
@@ -185,6 +274,7 @@ class H(BaseHTTPRequestHandler):
             code, data, ctype = e.code, e.read(), e.headers.get("Content-Type", "application/json")
         except Exception as e:
             self._json({"error": str(e)}, 502); return
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -192,6 +282,12 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
         self.close_connection = True
+        # Record the cache-HIT outcome signal: upstream latency (collapses on a
+        # reuse) + any prefill/usage fields. Never let telemetry break the proxy.
+        try:
+            _log_forward_timing(summary, elapsed_ms, data, ctype)
+        except Exception as e:
+            print(f"[cc_proxy] forward timing log failed: {e}", flush=True)
 
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)

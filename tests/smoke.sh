@@ -95,11 +95,18 @@ pass "/v1/messages/count_tokens returned input_tokens"
 [ -f "$LOG/turn_002.json" ] || fail "expected $LOG/turn_002.json"
 python3 -c "
 import json,sys
-d=json.load(open('$LOG/turn_001.json'))
-assert d['num_tools']==2, d
-assert d['tool_bytes']>0, d
-print('turn_001: num_tools=%d tool_bytes=%d'%(d['num_tools'],d['tool_bytes']))
-" || fail "turn_001.json did not contain the expected fingerprints"
-pass "probe logged turn_*.json with tool fingerprints"
+d1=json.load(open('$LOG/turn_001.json'))
+d2=json.load(open('$LOG/turn_002.json'))
+assert d1['num_tools']==2, d1
+assert d1['tool_bytes']>0, d1
+# prefix-stability telemetry contract (cache-hit precondition):
+# turn 1 is the first tracked /v1/messages turn -> no prior to compare to.
+assert d1.get('prefix_stable_vs_prev') is None, d1
+# turn 2 compares against turn 1; the two requests differ -> prefix busted.
+assert d2.get('prev_front_sha256')==d1['front_sha256'], (d1,d2)
+assert d2.get('prefix_stable_vs_prev') is False, d2
+print('turn_001: num_tools=%d tool_bytes=%d | stability telemetry present'%(d1['num_tools'],d1['tool_bytes']))
+" || fail "turn_*.json did not contain the expected fingerprints + stability telemetry"
+pass "probe logged turn_*.json with tool fingerprints + prefix-stability verdict"
 
 printf '\n%sAll smoke tests passed.%s\n' "$C_G" "$C_0"
