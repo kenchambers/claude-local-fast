@@ -7,7 +7,15 @@ turn (~2 min) on an 8GB M1. Ollama's KV cache CAN reuse that prefix (~40x
 faster on turn 2) — but ONLY if the front of the prompt is byte-identical
 turn-to-turn. Claude Code injects per-turn dynamic content that may bust it.
 This proxy lets you (1) PROVE whether the prefix is stable (probe mode), and
-(2) later NORMALIZE it so reuse always engages (forward mode).
+(2) NORMALIZE the measured busters so reuse engages (CC_PROXY_NORMALIZE=1).
+
+Measured buster (Claude Code 2.1.x): an `anthropic-billing-header` at the very
+FRONT of the system prompt carries `cch=<hex>` — a per-request nonce that
+changes every turn (even within one --continue session) — plus a per-process
+`cc_version=X.Y.Z.<hex>` build suffix. Both sit ~74 bytes in, so they re-prefill
+the entire ~5-28k-token prefix every turn. Ollama is not Anthropic and ignores
+these, so rewriting them to a constant restores a byte-stable prefix without
+changing the model's instructions.
 
 Modes (env CC_PROXY_MODE):
   probe   (default): log each /v1/messages request's static prefix
@@ -36,8 +44,11 @@ Env:
   CC_PROXY_LOG=/tmp/cc_proxy       (where turn_NNN.* + summary.log land)
   CC_PROXY_UPSTREAM=http://127.0.0.1:11434   (Ollama, forward mode only)
   CC_PROXY_TIMEOUT_SEC=600         (upstream read timeout, forward mode only)
+  CC_PROXY_NORMALIZE=0|1           (rewrite per-request prefix nonces to a
+                                    constant before logging+forwarding; default
+                                    off → transparent passthrough)
 """
-import os, json, time, hashlib, threading, urllib.request, urllib.error
+import os, json, re, time, hashlib, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODE     = os.environ.get("CC_PROXY_MODE", "probe")
@@ -50,6 +61,34 @@ UPSTREAM = os.environ.get("CC_PROXY_UPSTREAM", "http://127.0.0.1:11434")
 # a request thread.
 UPSTREAM_TIMEOUT = float(os.environ.get("CC_PROXY_TIMEOUT_SEC", "600"))
 os.makedirs(LOGDIR, exist_ok=True)
+
+# ── Prefix normalization (opt-in: CC_PROXY_NORMALIZE=1) ──────────────────────
+# Claude Code injects per-request nonces at the FRONT of the system prompt (an
+# `anthropic-billing-header`) that bust Ollama prefix-KV reuse every turn — see
+# the module docstring. Rewriting them to a constant restores a byte-stable
+# prefix. The patterns only match inside that header's string value, so the JSON
+# stays valid; each is idempotent (the constant contains no hex, so it won't
+# re-match). If Claude Code changes the header format, the patterns simply stop
+# matching (norm=0 in summary.log) and the prefix-stability telemetry flags it.
+NORMALIZE = os.environ.get("CC_PROXY_NORMALIZE", "0").lower() not in ("", "0", "false", "no")
+_NORM_PATTERNS = (
+    (re.compile(r"cch=[0-9a-f]+"), "cch=NORMALIZED"),
+    (re.compile(r"(cc_version=\d+\.\d+\.\d+\.)[0-9a-f]+"), r"\1NORMALIZED"),
+)
+
+def _normalize_raw(raw):
+    """Rewrite known per-request prefix-busting nonces to constants.
+    Returns (new_raw_bytes, total_substitutions). No-ops (returns raw unchanged)
+    on decode failure or zero matches."""
+    try:
+        s = raw.decode("utf-8")
+    except Exception:
+        return raw, 0
+    total = 0
+    for rx, repl in _NORM_PATTERNS:
+        s, n = rx.subn(repl, s)
+        total += n
+    return (s.encode("utf-8") if total else raw), total
 
 _seq_lock = threading.Lock()
 _seq = 0
@@ -67,7 +106,7 @@ _last_msgs_front_sha = None
 def _sha(s):
     return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
 
-def log_request(body, beta, track_stability=False):
+def log_request(body, beta, track_stability=False, norm_subs=None):
     """Persist the static prefix (system+tools) + per-message fingerprints.
 
     When track_stability is set (real /v1/messages turns), also record whether
@@ -107,6 +146,7 @@ def log_request(body, beta, track_stability=False):
         "tool_bytes": len(tools_str), "system_bytes": len(sys_str),
         "front_sha256": front_sha, "anthropic_beta": beta,
         "prev_front_sha256": prev_front_sha, "prefix_stable_vs_prev": prefix_stable,
+        "normalized_tokens": norm_subs,
         "num_messages": len(messages), "messages": msg_fp,
     }
     with open(os.path.join(LOGDIR, f"turn_{seq:03d}.json"), "w") as f:
@@ -117,14 +157,15 @@ def log_request(body, beta, track_stability=False):
         mark = "first"
     else:
         mark = "yes" if prefix_stable else "no"
+    norm_str = f" norm={norm_subs}" if norm_subs is not None else ""
     with open(os.path.join(LOGDIR, "summary.log"), "a") as f:
         f.write(f"turn {seq:03d} | tools={summary['num_tools']:>2} "
                 f"tool_bytes={summary['tool_bytes']:>6} sys_bytes={summary['system_bytes']:>6} "
                 f"msgs={summary['num_messages']:>2} front_sha={front_sha[:12]} "
-                f"prefix_stable={mark:<5} beta={beta or '-'}\n")
+                f"prefix_stable={mark:<5}{norm_str} beta={beta or '-'}\n")
     return summary
 
-def _log_forward_timing(summary, elapsed_ms, data, ctype):
+def _log_forward_timing(summary, elapsed_ms, data, ctype, ttfb_ms=None):
     """Forward mode: record the per-turn cache-HIT outcome signal next to the
     request fingerprint. The headline is upstream wall-clock latency (it
     collapses ~40x on a prefix-KV reuse); prompt_eval_duration is parsed
@@ -138,6 +179,7 @@ def _log_forward_timing(summary, elapsed_ms, data, ctype):
     rec = {
         "seq": seq,
         "upstream_ms": round(elapsed_ms, 1),
+        "upstream_ttfb_ms": round(ttfb_ms, 1) if ttfb_ms is not None else None,
         "front_sha256": summary.get("front_sha256"),
         "prefix_stable_vs_prev": summary.get("prefix_stable_vs_prev"),
     }
@@ -162,9 +204,11 @@ def _log_forward_timing(summary, elapsed_ms, data, ctype):
         with open(os.path.join(LOGDIR, f"turn_{seq:03d}.timing.json"), "w") as f:
             json.dump(rec, f, indent=1)
     prefill = rec.get("prefill_seconds")
+    ttfb = rec.get("upstream_ttfb_ms")
     seq_str = f"{seq:03d}" if seq is not None else "?"
     with open(os.path.join(LOGDIR, "summary.log"), "a") as f:
         f.write(f"  forward seq={seq_str} upstream={rec['upstream_ms']:.0f}ms"
+                + (f" ttfb={ttfb:.0f}ms" if ttfb is not None else "")
                 + (f" prefill={prefill:.3f}s" if prefill is not None else "")
                 + "\n")
 
@@ -212,10 +256,22 @@ class H(BaseHTTPRequestHandler):
 
             is_msgs  = self.path.startswith("/v1/messages") and "count_tokens" not in self.path
             is_count = "count_tokens" in self.path
+
+            # Normalize ONCE, before both logging and forwarding, so the
+            # prefix-stability telemetry reflects the fix and Ollama receives the
+            # byte-stable bytes. Default off → `raw`/`body` are untouched.
+            norm_subs = None
+            if NORMALIZE and (is_msgs or is_count) and raw:
+                raw, norm_subs = _normalize_raw(raw)
+                try:
+                    body = json.loads(raw) if raw else {}
+                except Exception:
+                    body = {}
+
             summary = None
             if is_msgs or is_count:
                 try:
-                    summary = log_request(body, beta, track_stability=is_msgs)
+                    summary = log_request(body, beta, track_stability=is_msgs, norm_subs=norm_subs)
                 except Exception as e:
                     # Probe logging is the whole point in probe mode; surface
                     # failures to stderr instead of letting them vanish.
@@ -268,24 +324,53 @@ class H(BaseHTTPRequestHandler):
         t0 = time.monotonic()
         try:
             resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
-            code, data = resp.status, resp.read()
-            ctype = resp.headers.get("Content-Type", "application/json")
         except urllib.error.HTTPError as e:
-            code, data, ctype = e.code, e.read(), e.headers.get("Content-Type", "application/json")
+            resp = e
         except Exception as e:
             self._json({"error": str(e)}, 502); return
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
+        code = getattr(resp, "status", None) or getattr(resp, "code", 200)
+        ctype = resp.headers.get("Content-Type", "application/json")
+        ttfb_ms = None
+        if "event-stream" in (ctype or "").lower():
+            # SSE: relay chunks as they arrive so token streaming is preserved
+            # (close-delimited, no Content-Length — the body ends when we close).
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            buf = bytearray()
+            # read1() returns whatever a single underlying read yields, so trickled
+            # SSE events relay immediately. Plain read(n) would block until n bytes
+            # or EOF, coalescing the stream back into one buffered blob.
+            reader = resp.read1 if hasattr(resp, "read1") else resp.read
+            while True:
+                chunk = reader(65536)
+                if not chunk:
+                    break
+                if ttfb_ms is None:
+                    ttfb_ms = (time.monotonic() - t0) * 1000.0  # ≈ prefill time
+                try:
+                    self.wfile.write(chunk); self.wfile.flush()
+                except Exception:
+                    break
+                buf += chunk
+            data = bytes(buf)
+        else:
+            # Non-stream JSON: buffer and send with Content-Length (as before).
+            data = resp.read()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
         self.close_connection = True
-        # Record the cache-HIT outcome signal: upstream latency (collapses on a
-        # reuse) + any prefill/usage fields. Never let telemetry break the proxy.
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        # Record the cache-HIT outcome signal: upstream latency / TTFB (both
+        # collapse on a reuse) + any prefill/usage fields. Never break the proxy.
         try:
-            _log_forward_timing(summary, elapsed_ms, data, ctype)
+            _log_forward_timing(summary, elapsed_ms, data, ctype, ttfb_ms=ttfb_ms)
         except Exception as e:
             print(f"[cc_proxy] forward timing log failed: {e}", flush=True)
 

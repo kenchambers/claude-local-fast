@@ -44,6 +44,33 @@ which is why the medium profile keeps everything *except* `Task`.
 
 ---
 
+## The billing-header buster — and the normalizer fix (2026-06-24, Claude Code 2.1.170)
+
+The ~40× above only happens when the prefix is **byte-stable**. Measured with the
+model-free probe, Claude Code's *actual* requests are **not**: it injects an
+`anthropic-billing-header` at the very front of the system prompt —
+`cc_version=2.1.170.<hex>; cc_entrypoint=sdk-cli; cch=<hex>` — whose **`cch` is a
+per-request nonce that changes every turn**, even within one `--continue` session,
+on **both** the full and the fast `claude-local` (medium) profiles. At offset ~74
+it invalidates essentially the whole prefix, so every turn re-prefills.
+
+`proxy/cc_proxy.py` forward mode with `CC_PROXY_NORMALIZE=1` rewrites those two
+nonce spans to a constant (Ollama ignores billing headers), restoring reuse.
+Measured A/B on the **medium** profile (`qwen3-cc`, `/v1/messages` wall-clock,
+`max_tokens=1`, warm model):
+
+| condition | turn 1 | turn 2 | turn→turn |
+|---|---|---|---|
+| Control — `cch` varies per turn (Claude Code today) | 30.3 s | 27.5 s | **1.10× (no collapse)** |
+| Treatment — `cch` normalized to a constant | 27.6 s | **0.4 s** | **78.5× collapse** |
+
+**Turn-2 prefill 27.5 s → 0.4 s ≈ 78×.** Only the billing header is rewritten;
+system instructions, tool schemas, and messages are byte-for-byte unchanged. See
+[../plans/KV_CACHE_REUSE_PLAN.md](../plans/KV_CACHE_REUSE_PLAN.md) for the full
+method and the prefix-stability telemetry.
+
+---
+
 ## Reproduce it
 
 ### 1. Prompt size, model-free (the probe)

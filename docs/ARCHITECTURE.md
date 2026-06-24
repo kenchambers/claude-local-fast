@@ -78,10 +78,26 @@ the big tool-schema prefix is reuse-eligible *in principle*. It busts only if:
 - schema serialization is non-deterministic across turns, or
 - the model unloads between turns (`OLLAMA_KEEP_ALIVE` expiry).
 
-Measure stability with the model-free probe (`proxy/cc_proxy.py`):
-`claude-local-probe` captures two real turns; `claude-local-prefix-diff` reports
-✅ identical (reuse will engage) or ❌ with the exact busting bytes. If stable,
-raising `OLLAMA_KEEP_ALIVE` keeps the slot warm and turns 2+ are near-instant.
+**Measured (Claude Code 2.1.170):** the first of those *does* happen. Claude Code
+injects an `anthropic-billing-header` at the front of the system prompt —
+`cc_version=2.1.170.<hex>; cc_entrypoint=sdk-cli; cch=<hex>` — whose **`cch` is a
+per-request nonce that changes every turn** (even within one `--continue` session),
+on the full, the fast medium, **and** the airplane profiles. At ~74 bytes in, it
+busts reuse every turn. The proxy normalizer (`CC_PROXY_NORMALIZE=1`) rewrites it to
+a constant — Ollama ignores billing headers — restoring reuse: measured **27.5 s →
+0.4 s (~78×)** turn-2 prefill on the medium profile. The launchers wire this in via
+`cc_proxy.py` forward+normalize: **ON by default for the airplane launchers**
+(`claude-air`/`-full` — in flight prefill is pure battery-burning compute and the
+proxy is localhost-only, so reuse is a free, offline-safe win), **opt-in for the
+online launchers** (`export CLAUDE_LOCAL_FAST_NORMALIZE=1`). Force off anywhere with
+`CLAUDE_LOCAL_FAST_NORMALIZE=0`. See
+[BENCHMARKS.md](BENCHMARKS.md) and [../plans/KV_CACHE_REUSE_PLAN.md](../plans/KV_CACHE_REUSE_PLAN.md).
+
+Measure stability yourself with the model-free probe (`proxy/cc_proxy.py`):
+`claude-local-probe` captures two real turns and now auto-logs `prefix_stable_vs_prev`
+per turn; `claude-local-prefix-diff` reports ✅ identical or ❌ with the exact
+busting bytes. If stable, raising `OLLAMA_KEEP_ALIVE` keeps the slot warm and
+turns 2+ are near-instant.
 
 ## Why MLX loses on M1
 

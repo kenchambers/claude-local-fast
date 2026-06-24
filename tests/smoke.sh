@@ -109,4 +109,64 @@ print('turn_001: num_tools=%d tool_bytes=%d | stability telemetry present'%(d1['
 " || fail "turn_*.json did not contain the expected fingerprints + stability telemetry"
 pass "probe logged turn_*.json with tool fingerprints + prefix-stability verdict"
 
+# ---- 5. normalizer self-test (model-free, CC_PROXY_NORMALIZE=1) ----
+# Two requests whose only prefix difference is the per-request anthropic-billing-
+# header (cc_version build suffix + cch nonce). Normalization must collapse both
+# to a constant so the static prefix becomes byte-identical -> reuse-eligible.
+NPORT="$(python3 - <<'PY'
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()
+PY
+)"
+NLOG="$(mktemp -d "${TMPDIR:-/tmp}/clf_norm.XXXXXX")"
+CC_PROXY_MODE=probe CC_PROXY_PORT="$NPORT" CC_PROXY_LOG="$NLOG" CC_PROXY_NORMALIZE=1 \
+  python3 "$REPO/proxy/cc_proxy.py" >"$NLOG/server.log" 2>&1 &
+NPID=$!
+disown "$NPID" 2>/dev/null || true
+trap 'kill "$PROXY_PID" "$NPID" >/dev/null 2>&1 || true; rm -rf "$LOG" "$NLOG"' EXIT
+
+ok=0; tries=0
+while [ "$tries" -lt 40 ]; do
+  if curl -s "http://127.0.0.1:$NPORT/healthz" >/dev/null 2>&1; then ok=1; break; fi
+  sleep 0.25; tries=$((tries + 1))
+done
+[ "$ok" = 1 ] || fail "normalize cc_proxy did not start (see $NLOG/server.log)"
+
+N1='{"model":"t","system":"anthropic-billing-header: cc_version=2.1.170.aaa; cc_entrypoint=sdk-cli; cch=11111; helper","tools":[{"name":"Read"}],"messages":[{"role":"user","content":"a"}]}'
+N2='{"model":"t","system":"anthropic-billing-header: cc_version=2.1.170.bbb; cc_entrypoint=sdk-cli; cch=22222; helper","tools":[{"name":"Read"}],"messages":[{"role":"user","content":"b"}]}'
+curl -s -X POST "http://127.0.0.1:$NPORT/v1/messages" -H 'content-type: application/json' -d "$N1" >/dev/null
+curl -s -X POST "http://127.0.0.1:$NPORT/v1/messages" -H 'content-type: application/json' -d "$N2" >/dev/null
+python3 -c "
+import json
+d1=json.load(open('$NLOG/turn_001.json'))
+d2=json.load(open('$NLOG/turn_002.json'))
+# both turns matched the cch nonce + cc_version build suffix -> 2 substitutions each
+assert d1.get('normalized_tokens')==2, d1
+assert d2.get('normalized_tokens')==2, d2
+# after normalization the only prefix difference is erased -> prefix is reuse-eligible
+assert d2.get('prefix_stable_vs_prev') is True, d2
+print('normalizer: norm=2/turn, prefix_stable_vs_prev flips to True')
+" || fail "normalizer did not stabilize the prefix (CC_PROXY_NORMALIZE=1)"
+pass "CC_PROXY_NORMALIZE=1 collapses the billing-header nonce -> prefix reuse-eligible"
+
+# ---- 6. reuse-proxy routing decision (airplane default-on, online opt-in) ----
+# Source the launcher and exercise _claude_local_normalize_on directly: the helper
+# is what gates whether a launch routes through the forward+normalize reuse proxy.
+# Airplane launchers pass default=1, the online ones pass default=0, and an explicit
+# CLAUDE_LOCAL_FAST_NORMALIZE always wins (so =0 is a real opt-out, even on airplane).
+if CLAUDE_LOCAL_FAST_DIR="$REPO" zsh -c '
+  source "$CLAUDE_LOCAL_FAST_DIR/shell/claude-local-fast.zsh" >/dev/null 2>&1
+  v() { _claude_local_normalize_on "$1" && echo on || echo off; }
+  unset CLAUDE_LOCAL_FAST_NORMALIZE
+  [ "$(v 1)" = on  ] || { echo "airplane default should be on";          exit 1; }
+  [ "$(v 0)" = off ] || { echo "online default should be off (opt-in)";  exit 1; }
+  [ "$(CLAUDE_LOCAL_FAST_NORMALIZE=0 v 1)" = off ] || { echo "=0 must override airplane default"; exit 1; }
+  [ "$(CLAUDE_LOCAL_FAST_NORMALIZE=1 v 0)" = on  ] || { echo "=1 must override online default";   exit 1; }
+  [ "$(CLAUDE_LOCAL_FAST_NORMALIZE=garbage v 1)" = off ] || { echo "non-truthy must be off"; exit 1; }
+'; then
+  pass "reuse-proxy routing: airplane default-on, online opt-in, env overrides both"
+else
+  fail "reuse-proxy routing decision (_claude_local_normalize_on) regressed"
+fi
+
 printf '\n%sAll smoke tests passed.%s\n' "$C_G" "$C_0"

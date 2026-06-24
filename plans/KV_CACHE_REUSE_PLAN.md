@@ -1,10 +1,15 @@
 # Plan: maximize KV-cache reuse across `claude-local-fast`'s agentic loops
 
-**Status:** Phase 1 (grounding) and the smallest reversible increment of Phase 4
-(permanent telemetry) are **done**. Phases 2/5 (baseline + before/after) are
-**run-on-your-M1** steps with a results template below. Further code is **gated on
-those measurements** — we do not change the byte stream until a measured prefix
-buster justifies it.
+**Status:** Phases 1–5 **done and measured** (2026-06-24). Phase 1 (grounding) +
+telemetry shipped first; Phase 2 measurement then found a concrete prefix buster,
+which justified and drove the Phase 4 normalizer; Phase 5 confirmed the win on the
+real model. Numbers in [§ Measured results](#measured-results-2026-06-24).
+
+> **Headline:** Claude Code injects an `anthropic-billing-header` with a per-request
+> `cch=<hex>` nonce at the **front** of the system prompt that busts Ollama prefix-KV
+> reuse on **every** turn — even on the fast `claude-local` (medium) default. The
+> opt-in proxy normalizer (`CC_PROXY_NORMALIZE=1`) rewrites it to a constant,
+> measured to collapse turn-2 prefill **27.5 s → 0.4 s (~78×)** on qwen3-cc.
 
 > **Scope reconciliation.** The originating task was written for a generic
 > multi-provider router (`cc_bridge.py`, MT5, OpenAI/Google/DeepSeek/vLLM…). **None
@@ -139,64 +144,101 @@ log its one-time re-prefill cost. (N/A today, documented so it isn't done silent
    is **wall-clock prefill seconds per loop**, which is the success metric here. $
    cache savings only apply to the future cascade leg (`cache_read` vs `input`).
 
-### Rollback & smallest reversible first increment
+### Rollback & increments
 
-- **Increment 1 (DONE):** permanent telemetry in `proxy/cc_proxy.py` + a smoke-test
-  contract in `tests/smoke.sh`. **No launcher / Modelfile / settings change.**
-  Rollback = revert those two files; nothing else is affected.
-- **Next increments (GATED on Phase 2 numbers):**
-  - If the prefix is already stable (expected): **no code change** — just raise
-    `OLLAMA_KEEP_ALIVE` so warm reuse is automatic, and fold the baseline numbers
-    into `docs/BENCHMARKS.md`.
-  - If the probe reveals a *specific* buster (a nonce/date/non-deterministic schema
-    in the prefix): add a **forward-mode normalizer** in `cc_proxy.py` that rewrites
-    **only** the busting bytes (the proxy docstring's long-promised "normalize"),
-    behind a flag, idempotent and append-only-safe; then re-measure.
+- **Increment 1 (DONE):** permanent telemetry in `proxy/cc_proxy.py` + smoke
+  contract in `tests/smoke.sh`. No launcher/Modelfile/settings change.
+- **Increment 2 (DONE — justified by Phase 2):** Phase 2 found a *specific* buster
+  (the `cch` nonce), so the **forward-mode normalizer** was built: opt-in
+  `CC_PROXY_NORMALIZE=1`, idempotent, rewrites **only** the two billing-header
+  nonce spans to a constant, append-only-safe. Default **off** → transparent, so
+  rollback is `unset CC_PROXY_NORMALIZE` (or revert `cc_proxy.py`); no launcher
+  change yet.
+- **Increment 3 (DONE — opt-in, PR #5):** `CLAUDE_LOCAL_FAST_NORMALIZE=1` routes the
+  launchers through `cc_proxy.py` forward+normalize (auto-started on port 11436), so
+  the win needs no manual proxy. The proxy also gained an SSE **stream-through** fix
+  (`read1()`) so interactive token streaming is preserved. Default **off** (reversible;
+  `unset` the var). Validated end-to-end (warm `--continue` 33.9 s → 14.4 s,
+  prefix_stable no→yes). **Default-on** is a proposed trivial follow-up once burned in.
 
 ---
 
-## Phase 4 — Implement (increment 1, done)
+## Phase 4 — Implement (done)
 
 `proxy/cc_proxy.py`:
-- `prefix_stable_vs_prev` per real `/v1/messages` turn (both modes) — the cache-hit
-  precondition, automatic and permanent (`turn_NNN.json` + `summary.log`).
-- Forward mode: per-turn **upstream latency** + defensive parse of prefill/usage
-  fields → `turn_NNN.timing.json` (`prefill_seconds` from ns when native fields are
-  present; `usage_*` from the Anthropic-compat shape).
+- **Telemetry:** `prefix_stable_vs_prev` per real `/v1/messages` turn (both modes) —
+  the cache-hit precondition, automatic (`turn_NNN.json` + `summary.log`). Forward
+  mode also logs per-turn **upstream latency** + defensive prefill/usage parse →
+  `turn_NNN.timing.json`.
+- **Normalizer (`CC_PROXY_NORMALIZE=1`, default off):** rewrites the per-request
+  prefix nonces — `cch=<hex>` and the `cc_version=X.Y.Z.<hex>` build suffix — to a
+  constant, applied **once** before both logging and forwarding, so the telemetry
+  reflects the fix and Ollama receives byte-stable bytes. Idempotent (the constant
+  has no hex, so it can't re-match); if Claude Code changes the header format the
+  patterns simply stop matching (`norm=0`) and the stability telemetry flags it.
 
-`tests/smoke.sh`: asserts the stability-telemetry contract (turn 1 = `null`, turn 2
-compares to turn 1) so it can't silently regress. Stays model-free / CI-safe.
+`tests/smoke.sh`: asserts the stability-telemetry contract **and** that
+`CC_PROXY_NORMALIZE=1` collapses the nonce (`norm=2`, `prefix_stable_vs_prev` flips
+to `true`). Model-free / CI-safe.
 
 ---
 
-## Phase 5 — Validate (you run; report before/after)
+## Measured results (2026-06-24)
 
-Re-run the Phase 2 commands after any gated change and fill the template. If the
-uplift doesn't materialize, **do not rationalize it** — read `summary.log`, find the
-turn where `prefix_stable_vs_prev` flips to `false`, and diff `turn_NNN.front.txt`
-against the prior turn to locate the busting bytes.
+Hardware: this 8 GB M1. Claude Code 2.1.170. Ollama tuned env
+(`OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`, `KEEP_ALIVE=5m`).
 
-### Results template (fill on your M1)
+### Phase 2 — baseline / the buster (model-free probe)
+
+Both the **full** (`qwen3-local`, 29 tools, ~93 KB front) and **medium**
+(`qwen3-cc`, 7 tools, `tool_bytes=8929`) profiles fail the precondition: the static
+prefix is *not* byte-stable turn-to-turn. Same length, different `front_sha`, in **2
+spans at offset ~74–106 of the system prompt**:
 
 ```
-Backend / profile: qwen3-cc / claude-local (medium)
-Date:
-Claude Code version:        ollama --version:
-
-Baseline (Phase 2)
-  num_tools / tool_bytes:            ___ / ___
-  input_tokens (medium vs full):     ___ / ___
-  prefill tok/s (turn 1):            ___
-  prefill DURATION turn 1 → turn 2:  ___ s → ___ s   (collapse factor: ___×)
-  prefix_stable_vs_prev (turns 2..N):  ___   (yes/no per turn)
-
-After (Phase 5, post-gated-change if any)
-  prefill DURATION turn 1 → turn 2:  ___ s → ___ s   (collapse factor: ___×)
-  prefix_stable_vs_prev (turns 2..N):  ___
-  behavior/output unchanged?           yes / no
-
-Verdict vs success criteria:
-  (1) prefix stable turns 2..N?  ___
-  (2) duration collapse ≥10×?    ___
-  (3) output unchanged?          ___
+anthropic-billing-header: cc_version=2.1.170.<hex>; cc_entrypoint=sdk-cli; cch=<hex>;
+                                              ^^^^^                            ^^^^^
+                                      per-process suffix             per-REQUEST nonce
 ```
+
+`--continue` (same session) isolates it: `cc_version` suffix stays constant,
+**`cch` changes every request** (e.g. `3798c → 32a3c`). So `prefix_stable_vs_prev =
+false` every turn, even within one agentic loop, on the fast default. This is the
+exact "a nonce changes an early token" buster ARCHITECTURE.md warned about — now
+named.
+
+### Phase 5 — after the normalizer (real model, qwen3-cc, medium)
+
+Model-free precondition (probe + `CC_PROXY_NORMALIZE=1`): `prefix_stable_vs_prev`
+flips **`no → yes`**, both fronts identical (`norm=2`/turn).
+
+Real-model A/B (`/v1/messages` wall-clock, `max_tokens=1`, warm model):
+
+| condition | turn 1 | turn 2 | turn→turn |
+|---|---|---|---|
+| Control (`cch` varies — Claude Code today) | 30.3 s | 27.5 s | **1.10× (no collapse)** |
+| Treatment (`cch` normalized) | 27.6 s | **0.4 s** | **78.5× collapse** |
+
+**Turn-2 prefill 27.5 s → 0.4 s ≈ 78× faster.**
+
+| success criterion | result |
+|---|---|
+| (1) prefix stable turns 2..N (normalized) | ✅ `prefix_stable_vs_prev=true`, identical `front_sha` |
+| (2) prefill collapse ≥10× | ✅ ~78× (beats the ~40× target) |
+| (3) output unchanged | ✅ only the billing header (which Ollama ignores) is rewritten; system instructions, tools, and messages are byte-for-byte untouched |
+
+### Reproduce
+
+```bash
+# precondition (model-free): no -> yes
+claude-local-probe                              # 2 turns, Ctrl-C
+grep prefix_stable "${TMPDIR:-/tmp}/cc_proxy/summary.log"     # expect prefix_stable=no
+# then run the same 2 turns through forward+normalize and re-check (expect yes):
+CC_PROXY_MODE=forward CC_PROXY_NORMALIZE=1 python3 proxy/cc_proxy.py &  # → :11435
+# point a launcher's ANTHROPIC_BASE_URL at :11435, send 2 turns, read summary.log
+```
+
+> Caveat: the A/B replays one captured medium request directly to Ollama (to avoid
+> Claude Code's tool-loop noise and any tool execution); it faithfully reproduces the
+> bytes the proxy forwards. The win requires the warm slot (`OLLAMA_KEEP_ALIVE`) to
+> still hold the prefix — see Increment 3 for making it automatic.
