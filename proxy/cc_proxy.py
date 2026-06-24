@@ -165,7 +165,7 @@ def log_request(body, beta, track_stability=False, norm_subs=None):
                 f"prefix_stable={mark:<5}{norm_str} beta={beta or '-'}\n")
     return summary
 
-def _log_forward_timing(summary, elapsed_ms, data, ctype):
+def _log_forward_timing(summary, elapsed_ms, data, ctype, ttfb_ms=None):
     """Forward mode: record the per-turn cache-HIT outcome signal next to the
     request fingerprint. The headline is upstream wall-clock latency (it
     collapses ~40x on a prefix-KV reuse); prompt_eval_duration is parsed
@@ -179,6 +179,7 @@ def _log_forward_timing(summary, elapsed_ms, data, ctype):
     rec = {
         "seq": seq,
         "upstream_ms": round(elapsed_ms, 1),
+        "upstream_ttfb_ms": round(ttfb_ms, 1) if ttfb_ms is not None else None,
         "front_sha256": summary.get("front_sha256"),
         "prefix_stable_vs_prev": summary.get("prefix_stable_vs_prev"),
     }
@@ -203,9 +204,11 @@ def _log_forward_timing(summary, elapsed_ms, data, ctype):
         with open(os.path.join(LOGDIR, f"turn_{seq:03d}.timing.json"), "w") as f:
             json.dump(rec, f, indent=1)
     prefill = rec.get("prefill_seconds")
+    ttfb = rec.get("upstream_ttfb_ms")
     seq_str = f"{seq:03d}" if seq is not None else "?"
     with open(os.path.join(LOGDIR, "summary.log"), "a") as f:
         f.write(f"  forward seq={seq_str} upstream={rec['upstream_ms']:.0f}ms"
+                + (f" ttfb={ttfb:.0f}ms" if ttfb is not None else "")
                 + (f" prefill={prefill:.3f}s" if prefill is not None else "")
                 + "\n")
 
@@ -321,24 +324,53 @@ class H(BaseHTTPRequestHandler):
         t0 = time.monotonic()
         try:
             resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
-            code, data = resp.status, resp.read()
-            ctype = resp.headers.get("Content-Type", "application/json")
         except urllib.error.HTTPError as e:
-            code, data, ctype = e.code, e.read(), e.headers.get("Content-Type", "application/json")
+            resp = e
         except Exception as e:
             self._json({"error": str(e)}, 502); return
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
+        code = getattr(resp, "status", None) or getattr(resp, "code", 200)
+        ctype = resp.headers.get("Content-Type", "application/json")
+        ttfb_ms = None
+        if "event-stream" in (ctype or "").lower():
+            # SSE: relay chunks as they arrive so token streaming is preserved
+            # (close-delimited, no Content-Length — the body ends when we close).
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            buf = bytearray()
+            # read1() returns whatever a single underlying read yields, so trickled
+            # SSE events relay immediately. Plain read(n) would block until n bytes
+            # or EOF, coalescing the stream back into one buffered blob.
+            reader = resp.read1 if hasattr(resp, "read1") else resp.read
+            while True:
+                chunk = reader(65536)
+                if not chunk:
+                    break
+                if ttfb_ms is None:
+                    ttfb_ms = (time.monotonic() - t0) * 1000.0  # ≈ prefill time
+                try:
+                    self.wfile.write(chunk); self.wfile.flush()
+                except Exception:
+                    break
+                buf += chunk
+            data = bytes(buf)
+        else:
+            # Non-stream JSON: buffer and send with Content-Length (as before).
+            data = resp.read()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
         self.close_connection = True
-        # Record the cache-HIT outcome signal: upstream latency (collapses on a
-        # reuse) + any prefill/usage fields. Never let telemetry break the proxy.
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        # Record the cache-HIT outcome signal: upstream latency / TTFB (both
+        # collapse on a reuse) + any prefill/usage fields. Never break the proxy.
         try:
-            _log_forward_timing(summary, elapsed_ms, data, ctype)
+            _log_forward_timing(summary, elapsed_ms, data, ctype, ttfb_ms=ttfb_ms)
         except Exception as e:
             print(f"[cc_proxy] forward timing log failed: {e}", flush=True)
 

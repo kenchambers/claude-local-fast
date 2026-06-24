@@ -81,12 +81,69 @@ _ensure_ollama_model() {   # $1=tag  $2=modelfile
     ollama create "$1" -f "$2"
 }
 
+# ────────────────────────────────────────────────────────────────────
+# Prefix-KV reuse: the cc_proxy forward+normalize "reuse proxy"
+# ────────────────────────────────────────────────────────────────────
+# Claude Code injects a per-request `cch` nonce in an anthropic-billing-header at
+# the FRONT of the system prompt, which busts Ollama's prefix-KV cache every turn
+# (even on the fast medium profile). cc_proxy.py in forward+normalize mode rewrites
+# that nonce to a constant so the prefix is byte-stable and Ollama reuses it —
+# measured ~20s/turn saved on warm medium turns (prefill-only collapse ~78x).
+#
+# Default: ON for the AIRPLANE launchers (in flight, prefill is pure battery-burning
+# compute and the reuse proxy is localhost-only, so reuse is a free win), OPT-IN for
+# the online launchers (set CLAUDE_LOCAL_FAST_NORMALIZE=1 — held opt-in to burn the
+# proxy in as a reliability surface). CLAUDE_LOCAL_FAST_NORMALIZE, when set, wins
+# either way: 0/false/no/off forces it OFF (even on airplane), 1/true/yes/on forces
+# it ON. Port 11436 (the probe uses 11435; keep them distinct so a probe never
+# reuses a forwarding proxy and loads the model).
+typeset -g _CLAUDE_LOCAL_FAST_OWNS_PROXY=0
+
+# Decide whether THIS launch routes through the reuse proxy. $1 is the per-launcher
+# default (0|1) used only when CLAUDE_LOCAL_FAST_NORMALIZE is unset/empty; an
+# explicit env value always overrides it (so `=0` is a real opt-out, unlike a bare
+# -n test which treats "0" as set/true).
+_claude_local_normalize_on() {   # $1 = default (0|1) when env unset/empty
+    local v="${CLAUDE_LOCAL_FAST_NORMALIZE:-}"
+    [ -z "$v" ] && v="${1:-0}"
+    case "$v" in (1|true|TRUE|yes|YES|on|ON) return 0 ;; (*) return 1 ;; esac
+}
+_claude_local_ensure_reuse_proxy() {
+    local PORT=11436
+    curl -s "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && return 0
+    command -v python3 >/dev/null 2>&1 || { echo "⚠️  python3 missing — can't start the reuse proxy; using Ollama directly (no reuse)." >&2; return 1; }
+    echo "🔁 reuse proxy: cc_proxy forward+normalize on 127.0.0.1:$PORT (strips the cch nonce → Ollama reuses the prefix)" >&2
+    CC_PROXY_MODE=forward CC_PROXY_NORMALIZE=1 CC_PROXY_PORT=$PORT \
+        CC_PROXY_UPSTREAM="http://127.0.0.1:11434" \
+        CC_PROXY_LOG="$CLAUDE_LOCAL_FAST_PROBE_LOG" \
+        nohup python3 "$CLAUDE_LOCAL_FAST_DIR/proxy/cc_proxy.py" >"${TMPDIR:-/tmp}/cc_proxy.fwd.log" 2>&1 &
+    _CLAUDE_LOCAL_FAST_OWNS_PROXY=1
+    local i
+    for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && return 0; sleep 0.3; done
+    echo "⚠️  reuse proxy didn't come up — using Ollama directly (no reuse). See ${TMPDIR:-/tmp}/cc_proxy.fwd.log" >&2
+    return 1
+}
+
+# Stop the reuse proxy we started, on shell exit (tiny idle process, but it holds
+# a port + RAM). Only the shell that started it does this.
+_claude_local_stop_reuse_proxy() {
+    [ "${_CLAUDE_LOCAL_FAST_OWNS_PROXY:-0}" = 1 ] || return 0
+    pkill -f "$CLAUDE_LOCAL_FAST_DIR/proxy/cc_proxy.py" >/dev/null 2>&1
+    _CLAUDE_LOCAL_FAST_OWNS_PROXY=0
+}
+autoload -Uz add-zsh-hook 2>/dev/null \
+    && add-zsh-hook zshexit _claude_local_stop_reuse_proxy
+
 # Launch full-profile Claude Code (ALL built-in tools) pointed at a local model.
-_claude_local_launch() {   # $1=tag ; rest = claude args
+_claude_local_launch() {   # $1=tag  $2=normalize-default(0|1) ; rest = claude args
     _claude_local_require_claude || return 1
-    local MODEL="$1"; shift
+    local MODEL="$1" NORM_DEFAULT="$2"; shift 2
+    # Resolve the base URL inline (no subshell) so _claude_local_ensure_reuse_proxy
+    # can background the proxy and set ownership in THIS shell, not a $() subshell.
+    local BASE="http://127.0.0.1:11434"
+    _claude_local_normalize_on "$NORM_DEFAULT" && _claude_local_ensure_reuse_proxy && BASE="http://127.0.0.1:11436"
     env -u ANTHROPIC_API_KEY \
-        ANTHROPIC_BASE_URL="http://127.0.0.1:11434" \
+        ANTHROPIC_BASE_URL="$BASE" \
         ANTHROPIC_AUTH_TOKEN="ollama" \
         ANTHROPIC_MODEL="$MODEL" \
         ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
@@ -105,11 +162,13 @@ _claude_local_launch() {   # $1=tag ; rest = claude args
 # a tiny one and drops unused tool schemas (~28k → ~3-5k tokens). All trimming
 # is PER-INVOCATION (--agent / --settings / --strict-mcp-config), so plain
 # `claude` and the -full launchers are unaffected.
-_claude_local_agent_launch() {   # $1=tag  $2=agent-name  $3=agents-json  $4=max-output ; rest=claude args
+_claude_local_agent_launch() {   # $1=tag  $2=agent-name  $3=agents-json  $4=max-output  $5=normalize-default(0|1) ; rest=claude args
     _claude_local_require_claude || return 1
-    local MODEL="$1" AGENT="$2" AGENTS="$3" MAXOUT="$4"; shift 4
+    local MODEL="$1" AGENT="$2" AGENTS="$3" MAXOUT="$4" NORM_DEFAULT="$5"; shift 5
+    local BASE="http://127.0.0.1:11434"
+    _claude_local_normalize_on "$NORM_DEFAULT" && _claude_local_ensure_reuse_proxy && BASE="http://127.0.0.1:11436"
     env -u ANTHROPIC_API_KEY \
-        ANTHROPIC_BASE_URL="http://127.0.0.1:11434" \
+        ANTHROPIC_BASE_URL="$BASE" \
         ANTHROPIC_AUTH_TOKEN="ollama" \
         ANTHROPIC_MODEL="$MODEL" \
         ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
@@ -142,7 +201,7 @@ claude-code() {
     echo "⚡ claude-code → qwen3-cc  (Qwen3 4B · 12k ctx · minimal agent: Read/Write/Edit/Bash/Grep/Glob)"
     echo "   Prompt ~28k→~3.3k tokens (~27s vs ~2min). Plain 'claude'/'claude-local'/'claude-air' unaffected."
     local agents='{"local":{"description":"Fast local coding assistant","prompt":"You are a fast, concise on-device coding assistant running on a small local model. Be brief and direct. You have working file-system tools and you ARE inside the user repository. When asked anything about the repo, files, or code, you MUST first call a tool to inspect it (use Glob pattern **/* or Bash ls to list, Grep to search, Read to open). NEVER say you lack file access or ask the user to paste files; call a tool instead. Act via tool calls, not prose. Prefer Grep/Glob for search and keep explanations short.","tools":["Read","Write","Edit","Bash","Grep","Glob"]}}'
-    _claude_local_agent_launch qwen3-cc local "$agents" 4096 "$@"
+    _claude_local_agent_launch qwen3-cc local "$agents" 4096 0 "$@"   # 0 = reuse proxy opt-in
 }
 
 # claude-local-medium — 10-tool agent that ADDS WebFetch/WebSearch/TodoWrite/
@@ -155,7 +214,7 @@ claude-local-medium() {
     echo "⚙️  claude-local-medium → qwen3-cc  (10 tools, no Task · ~5k-token prompt)"
     echo "   Read/Write/Edit/Bash/Grep/Glob + WebFetch/WebSearch/TodoWrite/NotebookEdit."
     local agents='{"medium":{"description":"Capable local coding assistant","prompt":"You are a capable on-device coding assistant running on a small local model. Be concise and direct. Use the tools to read, search, edit, write and run code, fetch web pages and search the web. You have working file-system tools and you ARE inside the user repository. When asked anything about the repo, files, or code, you MUST first call a tool to inspect it (use Glob pattern **/* or Bash ls to list, Grep to search, Read to open). NEVER say you lack file access or ask the user to paste files; call a tool instead. Act via tool calls, not prose. Keep explanations short.","tools":["Read","Write","Edit","Bash","Grep","Glob","WebFetch","WebSearch","TodoWrite","NotebookEdit"]}}'
-    _claude_local_agent_launch qwen3-cc medium "$agents" 4096 "$@"
+    _claude_local_agent_launch qwen3-cc medium "$agents" 4096 0 "$@"   # 0 = reuse proxy opt-in
 }
 
 # claude-local-full — complete built-in tool set (~28k-token prompt, slow first
@@ -165,7 +224,7 @@ claude-local-full() {
     _ensure_ollama_model qwen3-local "$CLAUDE_LOCAL_FAST_DIR/ollama/Modelfile.qwen3-local" || return 1
     echo "🤖 claude-local-full → qwen3-local  (Qwen3 4B · 16k ctx · ALL tools · ~2min first turn)"
     echo "   Plain 'claude' still uses cloud Anthropic.  Fast default: claude-local (→ medium)."
-    _claude_local_launch qwen3-local "$@"
+    _claude_local_launch qwen3-local 0 "$@"   # 0 = reuse proxy opt-in
 }
 
 # claude-local — FAST medium profile. As a function (not an alias) it can
@@ -199,6 +258,17 @@ WHY medium is the default:
   • MLX is not faster on this M1. Reframe (arXiv 2509.07928 cascade): local for
     easy/offline turns, escalate heavy work to cloud `claude`.
 
+KV-reuse:  airplane = ON by default · online = opt-in (CLAUDE_LOCAL_FAST_NORMALIZE=1)
+  Claude Code injects a per-request `cch` nonce at the FRONT of the system prompt
+  that busts Ollama prefix-KV reuse EVERY turn. The launchers route through cc_proxy
+  (forward+normalize, localhost-only) which rewrites it to a constant → warm turns
+  reuse the prefix (~20s/turn saved on medium; prefill-only collapse ~78x).
+    • claude-air / claude-air-full → ON by default (in flight, prefill is just
+      battery-burning compute; the proxy is localhost so it's offline-safe).
+    • claude-local / -medium / -full / claude-code → set CLAUDE_LOCAL_FAST_NORMALIZE=1.
+    • Force OFF anywhere (incl. airplane):  CLAUDE_LOCAL_FAST_NORMALIZE=0
+  Watch it work:  grep prefix_stable "${TMPDIR:-/tmp}/cc_proxy/summary.log"
+
 Usage:  claude-local [claude args...]   |   claude-local --help   |   claude-local-full
 CL_HELP
             return 0 ;;
@@ -229,9 +299,10 @@ claude-air-fast() {
     _ensure_ollama_model qwen3-air "$CLAUDE_LOCAL_FAST_DIR/ollama/Modelfile.qwen3-air" || return 1
     _claude_air_warm
     echo "🛩️  claude-air-fast → qwen3-air  (8 tools, no Task/web · ~4k prompt · battery)"
-    echo "   If it ever hangs mid-session, run:  claude-ollama-reset"
+    echo "   KV-reuse ON by default (cch nonce normalized via localhost proxy → ~20s/warm turn,"
+    echo "   less battery). Disable with CLAUDE_LOCAL_FAST_NORMALIZE=0. Hangs? claude-ollama-reset"
     local agents='{"air":{"description":"Offline local coding assistant","prompt":"You are a capable on-device coding assistant running on a small local model with NO network access. Be concise and direct. You have working file-system tools and you ARE inside the user repository. When asked anything about the repo, files, or code, you MUST first call a tool to inspect it (use Glob pattern **/* or Bash ls to list, Grep to search, Read to open). NEVER say you lack file access or ask the user to paste files; call a tool instead. Act via tool calls, not prose. Keep explanations short.","tools":["Read","Write","Edit","Bash","Grep","Glob","TodoWrite","NotebookEdit"]}}'
-    _claude_local_agent_launch qwen3-air air "$agents" 4096 "$@"
+    _claude_local_agent_launch qwen3-air air "$agents" 4096 1 "$@"   # 1 = reuse proxy default-on (battery)
 }
 
 # claude-air-full — complete offline tool set incl. Task (~28k prompt, slow
@@ -242,8 +313,9 @@ claude-air-full() {
     _ensure_ollama_model qwen3-air "$CLAUDE_LOCAL_FAST_DIR/ollama/Modelfile.qwen3-air" || return 1
     _claude_air_warm
     echo "🛩️  claude-air-full → qwen3-air  (Qwen3 4B · 16k ctx · ALL tools · battery)"
-    echo "   If it ever hangs mid-session, run:  claude-ollama-reset"
-    _claude_local_launch qwen3-air "$@"
+    echo "   KV-reuse ON by default (cch nonce normalized via localhost proxy → reuses the ~28k"
+    echo "   tool-schema prefix). Disable with CLAUDE_LOCAL_FAST_NORMALIZE=0. Hangs? claude-ollama-reset"
+    _claude_local_launch qwen3-air 1 "$@"   # 1 = reuse proxy default-on (battery)
 }
 
 # claude-air → FAST airplane profile. --help prints the launcher cheatsheet.

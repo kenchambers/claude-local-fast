@@ -60,6 +60,23 @@ Diagnostics & recovery:
 All trimming is **per-invocation**, so plain `claude` keeps using cloud Anthropic
 and your existing routing untouched.
 
+### KV-cache reuse (the `cch` nonce fix)
+
+Claude Code injects a per-request `cch` nonce in an `anthropic-billing-header` at
+the **front** of the system prompt, which busts Ollama's prefix-KV cache on *every*
+turn. A small localhost proxy (`proxy/cc_proxy.py`, forward+normalize) rewrites that
+nonce to a constant so the prefix is byte-stable and Ollama reuses it — **~20 s saved
+per warm turn** on medium (prefill-only collapse ~78×).
+
+- **`claude-air` / `claude-air-full` → ON by default.** In flight, prefill is pure
+  battery-burning compute and the proxy is localhost-only (offline-safe), so reuse is
+  a free win. Falls back to direct Ollama if `python3` is missing.
+- **`claude-local` / `-medium` / `-full` / `claude-code` → opt-in:** `export CLAUDE_LOCAL_FAST_NORMALIZE=1`
+- **Force off anywhere** (including airplane): `CLAUDE_LOCAL_FAST_NORMALIZE=0`
+
+Watch it engage: `grep prefix_stable "${TMPDIR:-/tmp}/cc_proxy/summary.log"` (expect
+`prefix_stable=yes` from turn 2 on).
+
 ## Requirements
 
 - macOS on **Apple Silicon** (8 GB supported, 16 GB comfortable)

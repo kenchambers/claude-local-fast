@@ -149,4 +149,24 @@ print('normalizer: norm=2/turn, prefix_stable_vs_prev flips to True')
 " || fail "normalizer did not stabilize the prefix (CC_PROXY_NORMALIZE=1)"
 pass "CC_PROXY_NORMALIZE=1 collapses the billing-header nonce -> prefix reuse-eligible"
 
+# ---- 6. reuse-proxy routing decision (airplane default-on, online opt-in) ----
+# Source the launcher and exercise _claude_local_normalize_on directly: the helper
+# is what gates whether a launch routes through the forward+normalize reuse proxy.
+# Airplane launchers pass default=1, the online ones pass default=0, and an explicit
+# CLAUDE_LOCAL_FAST_NORMALIZE always wins (so =0 is a real opt-out, even on airplane).
+if CLAUDE_LOCAL_FAST_DIR="$REPO" zsh -c '
+  source "$CLAUDE_LOCAL_FAST_DIR/shell/claude-local-fast.zsh" >/dev/null 2>&1
+  v() { _claude_local_normalize_on "$1" && echo on || echo off; }
+  unset CLAUDE_LOCAL_FAST_NORMALIZE
+  [ "$(v 1)" = on  ] || { echo "airplane default should be on";          exit 1; }
+  [ "$(v 0)" = off ] || { echo "online default should be off (opt-in)";  exit 1; }
+  [ "$(CLAUDE_LOCAL_FAST_NORMALIZE=0 v 1)" = off ] || { echo "=0 must override airplane default"; exit 1; }
+  [ "$(CLAUDE_LOCAL_FAST_NORMALIZE=1 v 0)" = on  ] || { echo "=1 must override online default";   exit 1; }
+  [ "$(CLAUDE_LOCAL_FAST_NORMALIZE=garbage v 1)" = off ] || { echo "non-truthy must be off"; exit 1; }
+'; then
+  pass "reuse-proxy routing: airplane default-on, online opt-in, env overrides both"
+else
+  fail "reuse-proxy routing decision (_claude_local_normalize_on) regressed"
+fi
+
 printf '\n%sAll smoke tests passed.%s\n' "$C_G" "$C_0"
