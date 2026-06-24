@@ -90,7 +90,8 @@ a constant — Ollama ignores billing headers — restoring reuse: measured **27
 (`claude-air`/`-full` — in flight prefill is pure battery-burning compute and the
 proxy is localhost-only, so reuse is a free, offline-safe win), **opt-in for the
 online launchers** (`export CLAUDE_LOCAL_FAST_NORMALIZE=1`). Force off anywhere with
-`CLAUDE_LOCAL_FAST_NORMALIZE=0`. See
+`CLAUDE_LOCAL_FAST_NORMALIZE=0`. For the full offline runbook (pre-flight →
+in-flight → verify → recover) see [AIRPLANE_MODE.md](AIRPLANE_MODE.md). See also
 [BENCHMARKS.md](BENCHMARKS.md) and [../plans/KV_CACHE_REUSE_PLAN.md](../plans/KV_CACHE_REUSE_PLAN.md).
 
 Measure stability yourself with the model-free probe (`proxy/cc_proxy.py`):

@@ -43,8 +43,8 @@ claude-local --help
 | `claude-local` | → `claude-local-medium` (fast default) | ~5k tok | ~40 s cold, near-instant warm |
 | `claude-local-full` | full profile, ALL tools (incl. `Task`) | ~28k tok | ~2 min first turn |
 | `claude-code` | minimal 6-tool agent (Read/Write/Edit/Bash/Grep/Glob) | ~3k tok | fastest |
-| `claude-air` | → `claude-air-fast` (8 tools, offline, no web) | ~4k tok | fast, offline |
-| `claude-air-full` | airplane, ALL tools incl. `Task` (offline) | ~28k tok | slow first turn |
+| `claude-air` | → `claude-air-fast` (8 tools, offline, no web; **KV-reuse on**) | ~4k tok | fast, offline |
+| `claude-air-full` | airplane, ALL tools incl. `Task` (offline; **KV-reuse on**) | ~28k tok | slow first turn |
 | `claude` | cloud Anthropic (untouched) | — | cloud |
 
 Diagnostics & recovery:
@@ -77,6 +77,9 @@ per warm turn** on medium (prefill-only collapse ~78×).
 
 Watch it engage: `grep prefix_stable "${TMPDIR:-/tmp}/cc_proxy/summary.log"` (expect
 `prefix_stable=yes` from turn 2 on).
+
+✈️ **Flying?** The full pre-flight → in-flight → verify → recover runbook is in
+**[docs/AIRPLANE_MODE.md](docs/AIRPLANE_MODE.md)**.
 
 ### RAM hygiene (auto-stop Ollama)
 
