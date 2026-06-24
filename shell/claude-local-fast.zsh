@@ -16,7 +16,11 @@
 #   claude-air          FAST airplane (→ claude-air-fast, 8 tools, offline, ~4k)
 #   claude-air-full     airplane, complete offline tool set (~28k prompt)
 #   claude-ollama-reset force-restart Ollama if it hangs mid-session
+#   claude-local-stop   stop Ollama now (also auto-stops when this shell exits)
 #   claude-local-probe / -prefix-diff / -probe-stop   measure prefix stability
+#
+# RAM hygiene: the shell that starts Ollama also stops it on exit (frees the
+# daemon + any pinned model). Opt out with CLAUDE_LOCAL_FAST_NO_AUTOSTOP=1.
 #
 # Why not 64k ctx: a 64k KV cache (~4.6GB) + 2.5GB weights overcommits the
 # ~5.3GB usable on an 8GB M1 and spills to CPU — slow, hot, battery drain.
@@ -69,7 +73,49 @@ _ollama_serve_tuned() {
             sleep 1; t=$((t+1))
             [ "$t" -ge 20 ] && { echo "❌ Ollama didn't start — see ${TMPDIR:-/tmp}/ollama_serve.log"; return 1; }
         done
+        _CLAUDE_LOCAL_FAST_OWNS_OLLAMA=1   # WE spawned it → tear it down on shell exit
     fi
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Auto-stop Ollama when the shell that started it exits (frees RAM)
+# ────────────────────────────────────────────────────────────────────
+# OLLAMA_KEEP_ALIVE=5m only unloads the MODEL after idle; the `ollama serve`
+# daemon (and any pinned air model, keep_alive:-1) stays resident until the box
+# reboots. So the shell that spawned the daemon stops it on exit — unloading
+# every model first (frees the ~4GB), then killing the daemon and any orphaned
+# runner. Only the OWNER shell does this: a daemon you started elsewhere, or the
+# Ollama.app / `brew services` one, is left untouched (we never set the flag for
+# a daemon we merely reused).
+#
+# Opt out (keep the daemon alive across shell exits):  export
+# CLAUDE_LOCAL_FAST_NO_AUTOSTOP=1   (e.g. in ~/.zshrc before the managed block).
+# Multi-tab caveat: if tab A starts the daemon and tab B reuses it, closing tab A
+# stops the daemon under tab B. Rerun any claude-local command in B to respawn it.
+typeset -g _CLAUDE_LOCAL_FAST_OWNS_OLLAMA=0
+
+_claude_local_stop_ollama() {   # $1=force → stop even if this shell isn't the owner
+    [ -n "${CLAUDE_LOCAL_FAST_NO_AUTOSTOP:-}" ] && [ "$1" != force ] && return 0
+    [ "$1" = force ] || [ "${_CLAUDE_LOCAL_FAST_OWNS_OLLAMA:-0}" = 1 ] || return 0
+    command -v ollama >/dev/null 2>&1 || return 0
+    local m
+    for m in ${(f)"$(ollama ps 2>/dev/null | awk 'NR>1{print $1}')"}; do
+        [ -n "$m" ] && ollama stop "$m" >/dev/null 2>&1
+    done
+    pkill -x ollama >/dev/null 2>&1          # the daemon
+    pkill -f "ollama runner" >/dev/null 2>&1 # orphaned model runners
+    _CLAUDE_LOCAL_FAST_OWNS_OLLAMA=0
+}
+
+# Register the exit hook (zsh only; bash is unsupported per install_shell.sh).
+autoload -Uz add-zsh-hook 2>/dev/null \
+    && add-zsh-hook zshexit _claude_local_stop_ollama
+
+# claude-local-stop — manually stop Ollama now (frees RAM without quitting the
+# shell). Forces the stop even if another shell owns the daemon.
+claude-local-stop() {
+    _claude_local_stop_ollama force
+    echo "🧹 Stopped Ollama (models unloaded, daemon killed). Any claude-local command restarts it."
 }
 
 # Build a tuned model tag from its Modelfile if it doesn't exist yet.
@@ -248,6 +294,12 @@ claude-local — local Claude Code launchers (Qwen3-4B via Ollama, 8GB M1)
   claude-local-prefix-diff  diff two probed turns → will Ollama KV-reuse engage?
   claude-local-probe-stop   stop the probe proxy
   claude-ollama-reset       force-restart Ollama if it hangs mid-session
+  claude-local-stop         stop Ollama now (auto-runs when this shell exits)
+
+RAM hygiene:
+  • OLLAMA_KEEP_ALIVE=5m unloads the MODEL after idle; the shell that started the
+    daemon also STOPS it on exit (frees the daemon + any keep_alive:-1 air model).
+  • Keep Ollama resident across shell exits with: CLAUDE_LOCAL_FAST_NO_AUTOSTOP=1
 
 WHY medium is the default:
   • Full claude-local re-prefills a ~28k-token tool-schema prompt every turn at
