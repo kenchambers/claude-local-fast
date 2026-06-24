@@ -56,6 +56,7 @@ Diagnostics & recovery:
 | `claude-local-prefix-diff` | diff two probed turns → will Ollama KV-reuse engage? |
 | `claude-local-probe-stop` | stop the probe proxy |
 | `claude-ollama-reset` | force-restart Ollama if it hangs mid-session |
+| `claude-local-stop` | stop Ollama now — unload models + kill the daemon to free RAM |
 
 All trimming is **per-invocation**, so plain `claude` keeps using cloud Anthropic
 and your existing routing untouched.
@@ -76,6 +77,16 @@ per warm turn** on medium (prefill-only collapse ~78×).
 
 Watch it engage: `grep prefix_stable "${TMPDIR:-/tmp}/cc_proxy/summary.log"` (expect
 `prefix_stable=yes` from turn 2 on).
+
+### RAM hygiene (auto-stop Ollama)
+
+`OLLAMA_KEEP_ALIVE=5m` only unloads the **model** after it goes idle; the
+`ollama serve` daemon — and any model pinned by the airplane launchers
+(`keep_alive:-1`) — stays resident until reboot. So **the shell that started
+Ollama also stops it on exit**: it unloads every model (frees the ~4 GB) and kills
+the daemon. Only that owner shell does this, so a daemon started by Ollama.app or
+`brew services` is left alone. Free it sooner with `claude-local-stop`, or keep it
+resident across shell exits by exporting `CLAUDE_LOCAL_FAST_NO_AUTOSTOP=1`.
 
 ## Requirements
 
