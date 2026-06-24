@@ -151,11 +151,19 @@ non-SSE JSON stays buffered. A `zshexit` hook stops the proxy we started. Valida
 controlled real-model A/B (warm `--continue` 33.9 s → 14.4 s, prefix_stable no→yes),
 proxy lifecycle, SSE incremental relay, JSON path intact, `zsh -n`/smoke/shellcheck.
 
-**What's left (proposed, NOT done):**
-1. **Default-on** — flip `CLAUDE_LOCAL_FAST_NORMALIZE` to default-on for the fast
-   launchers once it's proven over a few real interactive sessions (trivial: change
-   the guard to opt-OUT). Holding off because routing every launch through a proxy is
-   a reliability surface worth burning in first.
+**What's left (proposed):**
+1. **Default-on — DONE for AIRPLANE (2026-06-24), still opt-in for online.**
+   `claude-air` / `claude-air-full` now route through the reuse proxy **by default**
+   (in flight, prefill is pure battery-burning compute and the proxy is localhost-only
+   → offline-safe; falls back to direct Ollama if `python3` is missing). The online
+   launchers (`claude-local`/`-medium`/`-full`/`claude-code`) stay **opt-in**
+   (`CLAUDE_LOCAL_FAST_NORMALIZE=1`) so the proxy keeps burning in as a reliability
+   surface there. Mechanism: `_claude_local_normalize_on <default>` predicate — the
+   env var, when set, always wins (`0/false/no/off` → off, `1/true/yes/on` → on; this
+   also **fixes** the old `-n` test that treated `=0` as on), and the per-launcher
+   default (airplane=1, online=0) decides only when the env var is unset/empty.
+   Covered by smoke test step 6 (routing truth table). Remaining: flip the online
+   launchers to default-on too once burned in (change their `0` arg to `1`).
 2. ~~Probe the airplane profile~~ **DONE (2026-06-24).** `claude-air` (qwen3-air,
    offline) carries the same `anthropic-billing-header` `cch` nonce at the front →
    `prefix_stable=no` (e.g. `cch=46dd6` vs `0d022`); with `CC_PROXY_NORMALIZE=1` both
