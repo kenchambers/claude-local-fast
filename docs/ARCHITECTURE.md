@@ -78,10 +78,21 @@ the big tool-schema prefix is reuse-eligible *in principle*. It busts only if:
 - schema serialization is non-deterministic across turns, or
 - the model unloads between turns (`OLLAMA_KEEP_ALIVE` expiry).
 
-Measure stability with the model-free probe (`proxy/cc_proxy.py`):
-`claude-local-probe` captures two real turns; `claude-local-prefix-diff` reports
-✅ identical (reuse will engage) or ❌ with the exact busting bytes. If stable,
-raising `OLLAMA_KEEP_ALIVE` keeps the slot warm and turns 2+ are near-instant.
+**Measured (Claude Code 2.1.170):** the first of those *does* happen. Claude Code
+injects an `anthropic-billing-header` at the front of the system prompt —
+`cc_version=2.1.170.<hex>; cc_entrypoint=sdk-cli; cch=<hex>` — whose **`cch` is a
+per-request nonce that changes every turn** (even within one `--continue` session),
+on both the full and the fast medium profiles. At ~74 bytes in, it busts reuse
+every turn. The opt-in proxy normalizer (`CC_PROXY_NORMALIZE=1`) rewrites it to a
+constant — Ollama ignores billing headers — restoring reuse: measured **27.5 s →
+0.4 s (~78×)** turn-2 prefill on the medium profile. See
+[BENCHMARKS.md](BENCHMARKS.md) and [../plans/KV_CACHE_REUSE_PLAN.md](../plans/KV_CACHE_REUSE_PLAN.md).
+
+Measure stability yourself with the model-free probe (`proxy/cc_proxy.py`):
+`claude-local-probe` captures two real turns and now auto-logs `prefix_stable_vs_prev`
+per turn; `claude-local-prefix-diff` reports ✅ identical or ❌ with the exact
+busting bytes. If stable, raising `OLLAMA_KEEP_ALIVE` keeps the slot warm and
+turns 2+ are near-instant.
 
 ## Why MLX loses on M1
 
