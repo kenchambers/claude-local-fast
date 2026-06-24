@@ -156,8 +156,14 @@ proxy lifecycle, SSE incremental relay, JSON path intact, `zsh -n`/smoke/shellch
    launchers once it's proven over a few real interactive sessions (trivial: change
    the guard to opt-OUT). Holding off because routing every launch through a proxy is
    a reliability surface worth burning in first.
-2. **Probe the airplane profile** (`claude-air-fast`, qwen3-air, 8 tools) — almost
-   certainly the same cch buster; confirm + that normalize fixes it.
+2. ~~Probe the airplane profile~~ **DONE (2026-06-24).** `claude-air` (qwen3-air,
+   offline) carries the same `anthropic-billing-header` `cch` nonce at the front →
+   `prefix_stable=no` (e.g. `cch=46dd6` vs `0d022`); with `CC_PROXY_NORMALIZE=1` both
+   fronts collapse to an identical `front_sha` (`prefix_stable=yes`, `norm=2`). So the
+   buster + fix are confirmed on all three profiles (full / medium / air). Model-free
+   probe via the fresh-`claude -p` harness (no `--continue`, so no transcript pollution).
+   Note: air's inlined `num_tools=5` (not the 8 listed) — Claude Code doesn't inline a
+   schema for every agent tool; cosmetic, unrelated to the buster.
 3. **Stale-handoff hygiene** — this doc + the test-dir pollution note (§8).
 
 **Honest gain framing for docs:** headline 78× is prefill-*only* (clean A/B); the
