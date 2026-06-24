@@ -81,12 +81,53 @@ _ensure_ollama_model() {   # $1=tag  $2=modelfile
     ollama create "$1" -f "$2"
 }
 
+# ────────────────────────────────────────────────────────────────────
+# Prefix-KV reuse: the cc_proxy forward+normalize "reuse proxy" (opt-in)
+# ────────────────────────────────────────────────────────────────────
+# Claude Code injects a per-request `cch` nonce in an anthropic-billing-header at
+# the FRONT of the system prompt, which busts Ollama's prefix-KV cache every turn
+# (even on the fast medium profile). cc_proxy.py in forward+normalize mode rewrites
+# that nonce to a constant so the prefix is byte-stable and Ollama reuses it —
+# measured ~20s/turn saved on warm medium turns (prefill-only collapse ~78x).
+# OPT IN with CLAUDE_LOCAL_FAST_NORMALIZE=1. Port 11436 (the probe uses 11435; keep
+# them distinct so a probe never reuses a forwarding proxy and loads the model).
+typeset -g _CLAUDE_LOCAL_FAST_OWNS_PROXY=0
+_claude_local_ensure_reuse_proxy() {
+    local PORT=11436
+    curl -s "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && return 0
+    command -v python3 >/dev/null 2>&1 || { echo "⚠️  python3 missing — can't start the reuse proxy; using Ollama directly (no reuse)." >&2; return 1; }
+    echo "🔁 reuse proxy: cc_proxy forward+normalize on 127.0.0.1:$PORT (strips the cch nonce → Ollama reuses the prefix)" >&2
+    CC_PROXY_MODE=forward CC_PROXY_NORMALIZE=1 CC_PROXY_PORT=$PORT \
+        CC_PROXY_UPSTREAM="http://127.0.0.1:11434" \
+        CC_PROXY_LOG="$CLAUDE_LOCAL_FAST_PROBE_LOG" \
+        nohup python3 "$CLAUDE_LOCAL_FAST_DIR/proxy/cc_proxy.py" >"${TMPDIR:-/tmp}/cc_proxy.fwd.log" 2>&1 &
+    _CLAUDE_LOCAL_FAST_OWNS_PROXY=1
+    local i
+    for i in $(seq 1 20); do curl -s "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && return 0; sleep 0.3; done
+    echo "⚠️  reuse proxy didn't come up — using Ollama directly (no reuse). See ${TMPDIR:-/tmp}/cc_proxy.fwd.log" >&2
+    return 1
+}
+
+# Stop the reuse proxy we started, on shell exit (tiny idle process, but it holds
+# a port + RAM). Only the shell that started it does this.
+_claude_local_stop_reuse_proxy() {
+    [ "${_CLAUDE_LOCAL_FAST_OWNS_PROXY:-0}" = 1 ] || return 0
+    pkill -f "$CLAUDE_LOCAL_FAST_DIR/proxy/cc_proxy.py" >/dev/null 2>&1
+    _CLAUDE_LOCAL_FAST_OWNS_PROXY=0
+}
+autoload -Uz add-zsh-hook 2>/dev/null \
+    && add-zsh-hook zshexit _claude_local_stop_reuse_proxy
+
 # Launch full-profile Claude Code (ALL built-in tools) pointed at a local model.
 _claude_local_launch() {   # $1=tag ; rest = claude args
     _claude_local_require_claude || return 1
     local MODEL="$1"; shift
+    # Resolve the base URL inline (no subshell) so _claude_local_ensure_reuse_proxy
+    # can background the proxy and set ownership in THIS shell, not a $() subshell.
+    local BASE="http://127.0.0.1:11434"
+    [ -n "${CLAUDE_LOCAL_FAST_NORMALIZE:-}" ] && _claude_local_ensure_reuse_proxy && BASE="http://127.0.0.1:11436"
     env -u ANTHROPIC_API_KEY \
-        ANTHROPIC_BASE_URL="http://127.0.0.1:11434" \
+        ANTHROPIC_BASE_URL="$BASE" \
         ANTHROPIC_AUTH_TOKEN="ollama" \
         ANTHROPIC_MODEL="$MODEL" \
         ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
@@ -108,8 +149,10 @@ _claude_local_launch() {   # $1=tag ; rest = claude args
 _claude_local_agent_launch() {   # $1=tag  $2=agent-name  $3=agents-json  $4=max-output ; rest=claude args
     _claude_local_require_claude || return 1
     local MODEL="$1" AGENT="$2" AGENTS="$3" MAXOUT="$4"; shift 4
+    local BASE="http://127.0.0.1:11434"
+    [ -n "${CLAUDE_LOCAL_FAST_NORMALIZE:-}" ] && _claude_local_ensure_reuse_proxy && BASE="http://127.0.0.1:11436"
     env -u ANTHROPIC_API_KEY \
-        ANTHROPIC_BASE_URL="http://127.0.0.1:11434" \
+        ANTHROPIC_BASE_URL="$BASE" \
         ANTHROPIC_AUTH_TOKEN="ollama" \
         ANTHROPIC_MODEL="$MODEL" \
         ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
@@ -198,6 +241,13 @@ WHY medium is the default:
     is byte-stable — check with claude-local-probe then claude-local-prefix-diff.
   • MLX is not faster on this M1. Reframe (arXiv 2509.07928 cascade): local for
     easy/offline turns, escalate heavy work to cloud `claude`.
+
+KV-reuse (opt-in):  export CLAUDE_LOCAL_FAST_NORMALIZE=1
+  Claude Code injects a per-request `cch` nonce at the FRONT of the system prompt
+  that busts Ollama prefix-KV reuse EVERY turn. With this set, the launchers route
+  through cc_proxy (forward+normalize) which rewrites it to a constant → warm turns
+  reuse the prefix (~20s/turn saved on medium; prefill-only collapse ~78x). Watch
+  it work:  grep prefix_stable "${TMPDIR:-/tmp}/cc_proxy/summary.log"
 
 Usage:  claude-local [claude args...]   |   claude-local --help   |   claude-local-full
 CL_HELP

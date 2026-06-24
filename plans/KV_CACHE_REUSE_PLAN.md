@@ -154,10 +154,12 @@ log its one-time re-prefill cost. (N/A today, documented so it isn't done silent
   nonce spans to a constant, append-only-safe. Default **off** → transparent, so
   rollback is `unset CC_PROXY_NORMALIZE` (or revert `cc_proxy.py`); no launcher
   change yet.
-- **Increment 3 (NOT done — proposed):** wire the launchers to route through
-  `cc_proxy.py` forward+normalize by default so the ~78× warm-turn win is automatic
-  (today it requires running the proxy manually). This *does* change launcher
-  behavior, so it's a separate, opt-in step — see § Next.
+- **Increment 3 (DONE — opt-in, PR #5):** `CLAUDE_LOCAL_FAST_NORMALIZE=1` routes the
+  launchers through `cc_proxy.py` forward+normalize (auto-started on port 11436), so
+  the win needs no manual proxy. The proxy also gained an SSE **stream-through** fix
+  (`read1()`) so interactive token streaming is preserved. Default **off** (reversible;
+  `unset` the var). Validated end-to-end (warm `--continue` 33.9 s → 14.4 s,
+  prefix_stable no→yes). **Default-on** is a proposed trivial follow-up once burned in.
 
 ---
 
